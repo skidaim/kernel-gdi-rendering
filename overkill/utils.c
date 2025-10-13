@@ -319,7 +319,7 @@ PUNICODE_STRING unicodestrstr(
 }
 
 // we need this as game file can be more than 14 characters with multiple instances (FortniteClient-Win64-Shipping.exe and FortniteClient-Win64-Shipping_EAC.exe. so we need the full image name.
-PEPROCESS GetGameProcess(PWCH szName)
+PEPROCESS GetProcess(PWCH szName)
 {
 	PEPROCESS Process = NULL;
 	PUNICODE_STRING ProcessName = NULL;  // Changed from PCHAR to PUNICODE_STRING
@@ -456,4 +456,380 @@ PVOID GetProcessBaseAddress(int pid)
 	PVOID Base = PsGetProcessSectionBaseAddress(pProcess);
 	ObDereferenceObject(pProcess);
 	return Base;
+}
+
+NTSTATUS ReadFileToBuffer(_In_ PUNICODE_STRING FilePath, _Out_ PKERNEL_BUFFER OutputBuffer)
+{
+	OBJECT_ATTRIBUTES objAttributes = { 0 };
+	HANDLE hFile = NULL;
+	NTSTATUS status;
+	IO_STATUS_BLOCK ioStatusBlock = { 0 };
+	FILE_STANDARD_INFORMATION fileInfo = { 0 };
+
+	if (!FilePath || !OutputBuffer)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+	{
+		return STATUS_INVALID_LEVEL;
+	}
+
+	InitializeObjectAttributes(&objAttributes, FilePath, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+	status = ZwCreateFile(&hFile,
+		GENERIC_READ,
+		&objAttributes,
+		&ioStatusBlock,
+		NULL,
+		FILE_ATTRIBUTE_NORMAL,
+		FILE_SHARE_READ,
+		FILE_OPEN,
+		FILE_SYNCHRONOUS_IO_NONALERT,
+		NULL,
+		0);
+
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: ZwCreateFile failed: 0x%X\n", status);
+		return status;
+	}
+
+	status = ZwQueryInformationFile(hFile, &ioStatusBlock, &fileInfo, sizeof(FILE_STANDARD_INFORMATION), FileStandardInformation);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: ZwQueryInformationFile failed: 0x%X\n", status);
+		ZwClose(hFile);
+		return status;
+	}
+
+	OutputBuffer->Size = fileInfo.EndOfFile.LowPart;
+	OutputBuffer->Buffer = ExAllocatePoolWithTag(NonPagedPool, OutputBuffer->Size, 'bPdb');
+
+	if (!OutputBuffer->Buffer)
+	{
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: Failed to allocate buffer for PDB file\n");
+		ZwClose(hFile);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	status = ZwReadFile(hFile, NULL, NULL, NULL, &ioStatusBlock, OutputBuffer->Buffer, (ULONG)OutputBuffer->Size, NULL, NULL);
+	ZwClose(hFile);
+
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: ZwReadFile failed: 0x%X\n", status);
+		ExFreePoolWithTag(OutputBuffer->Buffer, 'bPdb');
+		OutputBuffer->Buffer = NULL;
+		OutputBuffer->Size = 0;
+	}
+
+	return status;
+}
+
+NTSTATUS GetPdbSymbolStream(_In_ PVOID PdbBase, _Out_ PKERNEL_BUFFER SymbolStream)
+{
+	struct SuperBlock* superBlock = (struct SuperBlock*)PdbBase;
+
+	if (memcmp(superBlock->FileMagic, PDB_MAGIC, sizeof(PDB_MAGIC)) != 0)
+	{
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: Invalid PDB magic signature.\n");
+		return STATUS_INVALID_IMAGE_FORMAT;
+	}
+
+	const UINT32 blockSize = superBlock->BlockSize;
+	const UINT32 numDirectoryBytes = superBlock->NumDirectoryBytes;
+	const UINT32 numDirectoryBlocks = (numDirectoryBytes + blockSize - 1) / blockSize;
+
+	UINT32* directoryBlockMap = (UINT32*)((UINT8*)PdbBase + superBlock->BlockMapAddr * blockSize);
+
+	KERNEL_BUFFER directoryBuffer = { 0 };
+	directoryBuffer.Size = numDirectoryBytes;
+	directoryBuffer.Buffer = ExAllocatePoolWithTag(NonPagedPool, directoryBuffer.Size, 'drsP');
+	if (!directoryBuffer.Buffer)
+	{
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	UINT8* current_dir_pos = (UINT8*)directoryBuffer.Buffer;
+	SIZE_T bytes_to_copy;
+	for (UINT32 i = 0; i < numDirectoryBlocks; ++i)
+	{
+		UINT8* block_start = (UINT8*)PdbBase + directoryBlockMap[i] * blockSize;
+		bytes_to_copy = min(blockSize, directoryBuffer.Size - (i * blockSize));
+		memcpy(current_dir_pos, block_start, bytes_to_copy);
+		current_dir_pos += bytes_to_copy;
+	}
+
+	UINT32* streamData = (UINT32*)directoryBuffer.Buffer;
+	const UINT32 numStreams = *streamData++;
+	const UINT32* streamSizes = streamData;
+	UINT32* streamBlockIndices = (UINT32*)(streamSizes + numStreams);
+
+	if (numStreams < 4)
+	{
+		ExFreePoolWithTag(directoryBuffer.Buffer, 'drsP');
+		return STATUS_INVALID_IMAGE_FORMAT;
+	}
+
+	const UINT32 dbiStreamSize = streamSizes[3];
+	UINT32* dbiStreamBlocks = streamBlockIndices;
+	for (int i = 0; i < 3; i++)
+	{
+		dbiStreamBlocks += (streamSizes[i] + blockSize - 1) / blockSize;
+	}
+
+	KERNEL_BUFFER dbiStreamBuffer = { 0 };
+	dbiStreamBuffer.Size = dbiStreamSize;
+	dbiStreamBuffer.Buffer = ExAllocatePoolWithTag(NonPagedPool, dbiStreamBuffer.Size, 'ibDP');
+	if (!dbiStreamBuffer.Buffer)
+	{
+		ExFreePoolWithTag(directoryBuffer.Buffer, 'drsP');
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	UINT8* current_dbi_pos = (UINT8*)dbiStreamBuffer.Buffer;
+	const UINT32 numDbiBlocks = (dbiStreamSize + blockSize - 1) / blockSize;
+	for (UINT32 i = 0; i < numDbiBlocks; ++i)
+	{
+		UINT8* block_start = (UINT8*)PdbBase + dbiStreamBlocks[i] * blockSize;
+		bytes_to_copy = min(blockSize, dbiStreamBuffer.Size - (i * blockSize));
+		memcpy(current_dbi_pos, block_start, bytes_to_copy);
+		current_dbi_pos += bytes_to_copy;
+	}
+
+	struct DBIHeader* dbiHeader = (struct DBIHeader*)dbiStreamBuffer.Buffer;
+	const UINT16 symbolRecordStreamIndex = dbiHeader->SymRecordStream;
+	ExFreePoolWithTag(dbiStreamBuffer.Buffer, 'ibDP');
+
+	if (symbolRecordStreamIndex >= numStreams)
+	{
+		ExFreePoolWithTag(directoryBuffer.Buffer, 'drsP');
+		return STATUS_INVALID_IMAGE_FORMAT;
+	}
+
+	const UINT32 symbolStreamSize = streamSizes[symbolRecordStreamIndex];
+	UINT32* symbolStreamBlocks = streamBlockIndices;
+	for (int i = 0; i < symbolRecordStreamIndex; i++)
+	{
+		symbolStreamBlocks += (streamSizes[i] + blockSize - 1) / blockSize;
+	}
+
+	SymbolStream->Size = symbolStreamSize;
+	SymbolStream->Buffer = ExAllocatePoolWithTag(NonPagedPool, SymbolStream->Size, 'mySP');
+	if (!SymbolStream->Buffer)
+	{
+		ExFreePoolWithTag(directoryBuffer.Buffer, 'drsP');
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	UINT8* current_sym_pos = (UINT8*)SymbolStream->Buffer;
+	const UINT32 numSymbolBlocks = (symbolStreamSize + blockSize - 1) / blockSize;
+	for (UINT32 i = 0; i < numSymbolBlocks; ++i)
+	{
+		UINT8* block_start = (UINT8*)PdbBase + symbolStreamBlocks[i] * blockSize;
+		bytes_to_copy = min(blockSize, SymbolStream->Size - (i * blockSize));
+		memcpy(current_sym_pos, block_start, bytes_to_copy);
+		current_sym_pos += bytes_to_copy;
+	}
+
+	ExFreePoolWithTag(directoryBuffer.Buffer, 'drsP');
+	return STATUS_SUCCESS;
+}
+
+
+NTSTATUS FindSymbolRva(_In_ PKERNEL_BUFFER SymbolStream, _In_ PVOID PeFileBase, _In_ PCSTR SymbolName, _Out_ PULONG64 FinalRva)
+{
+	if (!SymbolStream || !SymbolStream->Buffer || !PeFileBase || !SymbolName || !FinalRva)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	// get the section headers from the PE file
+	PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)PeFileBase;
+	if (pDosHeader->e_magic != 'ZM') // "MZ"
+	{
+		return STATUS_INVALID_IMAGE_FORMAT;
+	}
+
+	PIMAGE_NT_HEADERS64 pNtHeaders = (PIMAGE_NT_HEADERS64)((UINT8*)PeFileBase + pDosHeader->e_lfanew);
+	if (pNtHeaders->Signature != 'EP') // "PE\0\0"
+	{
+		return STATUS_INVALID_IMAGE_FORMAT;
+	}
+
+	PIMAGE_SECTION_HEADER pSectionHeaders = (PIMAGE_SECTION_HEADER)((UINT8*)&pNtHeaders->OptionalHeader + pNtHeaders->FileHeader.SizeOfOptionalHeader);
+
+	// iterate through the PDB symbols
+	UINT8* it = (UINT8*)SymbolStream->Buffer;
+	const UINT8* end = it + SymbolStream->Size;
+
+	while (it < end)
+	{
+		struct PUBSYM32* current = (struct PUBSYM32*)it;
+		if (it + sizeof(UINT16) * 2 > end || it + current->reclen + 2 > end)
+		{
+			break; // no
+		}
+
+		if (current->rectyp == S_PUB32)
+		{
+			if (strcmp(current->name, SymbolName) == 0)
+			{
+				UINT16 sectionIndex = current->seg;
+
+				if (sectionIndex > 0 && sectionIndex <= pNtHeaders->FileHeader.NumberOfSections)
+				{
+					// look up the section header
+					PIMAGE_SECTION_HEADER symbolSection = &pSectionHeaders[sectionIndex - 1];
+
+					// calculate the final RVA
+					*FinalRva = symbolSection->VirtualAddress + current->off;
+
+					return STATUS_SUCCESS;
+				}
+			}
+		}
+		it += current->reclen + 2;
+	}
+
+	return STATUS_NOT_FOUND;
+}
+
+NTSTATUS PatchDwm()
+{
+	NTSTATUS status;
+	KERNEL_BUFFER pdbFileBuffer = { 0 };
+	KERNEL_BUFFER peFileBuffer = { 0 };
+	KERNEL_BUFFER symbolStreamBuffer = { 0 };
+	ULONG64 finalRva = 0;
+
+	uintptr_t dwmcoreBase = NULL;
+	PEPROCESS sourceProcess = GetProcess(L"dwm.exe");
+
+	if (!sourceProcess || PsGetProcessExitStatus(sourceProcess) != STATUS_PENDING) {
+		DbgPrintEx(0, 0, "cs2 not found\n");
+		return -1;
+	}
+
+
+
+	KAPC_STATE apcState;
+	KeStackAttachProcess(sourceProcess, &apcState);
+
+	PPEB pPeb = PsGetProcessPeb(sourceProcess);
+
+	if (pPeb) {
+		PPEB_LDR_DATA pLdr = pPeb->Ldr;
+		if (pLdr) {
+			PLIST_ENTRY pListHead = &pLdr->InMemoryOrderModuleList;
+			PLIST_ENTRY pListEntry = pListHead->Flink;
+
+			while (pListEntry != pListHead) {
+				PLDR_DATA_TABLE_ENTRY pEntry = CONTAINING_RECORD(pListEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+
+				if (pEntry->DllBase) {
+					UNICODE_STRING clientdll;
+					RtlInitUnicodeString(&clientdll, L"\\dwmcore.dll");
+					if (unicodestrstr(&pEntry->FullDllName, &clientdll)) {
+						dwmcoreBase = (uintptr_t)pEntry->DllBase;
+						break;
+					}
+
+				}
+
+				pListEntry = pListEntry->Flink;
+			}
+		}
+		else {
+			DbgPrintEx(0, 0, "pLdr NULL\n");
+		}
+	}
+	else {
+		DbgPrintEx(0, 0, "pPeb NULL\n");
+	}
+	KeUnstackDetachProcess(&apcState);
+
+
+
+
+	if (!dwmcoreBase) {
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "DWM_Patcher: Failed to get dwmcore.dll base address.\n");
+		return -2;
+	}
+
+	PCSTR target =
+		"?IsCandidateDirectFlipCompatbile@COverlayContext@@AEBA_NPEBVCCompositionSurfaceInfo@@PEAVISwapChainRealization@@AEBUDXGI_MULTIPLANE_OVERLAY_ATTRIBUTES@@W4DXGI_MODE_ROTATION@@I_N4@Z";
+	ULONG64 rva = 0;
+
+	UNICODE_STRING pdbPath = RTL_CONSTANT_STRING(L"\\SystemRoot\\System32\\dwmcore.pdb");
+	UNICODE_STRING pePath = RTL_CONSTANT_STRING(L"\\SystemRoot\\System32\\dwmcore.dll");
+
+	status = ReadFileToBuffer(&pdbPath, &pdbFileBuffer);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: Failed to read PDB file %wZ (0x%X).\n", &pdbPath, status);
+		return status;
+	}
+
+	status = ReadFileToBuffer(&pePath, &peFileBuffer);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: Failed to read PE file %wZ (0x%X).\n", &pePath, status);
+		ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
+		return status;
+	}
+
+	// parse PDB to get the symbol stream.
+	status = GetPdbSymbolStream(pdbFileBuffer.Buffer, &symbolStreamBuffer);
+	if (!NT_SUCCESS(status))
+	{
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: Failed to get symbol stream (0x%X).\n", status);
+		ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
+		ExFreePoolWithTag(peFileBuffer.Buffer, 'ePsP');
+		return status;
+	}
+
+	ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
+
+	// search for the symbol, calculating the correct RVA using the PE file data.
+	PCSTR targetSymbol = "?IsCandidateDirectFlipCompatbile@COverlayContext@@AEBA_NPEBVCCompositionSurfaceInfo@@PEAVISwapChainRealization@@AEBUDXGI_MULTIPLANE_OVERLAY_ATTRIBUTES@@W4DXGI_MODE_ROTATION@@I_N4@Z";
+	status = FindSymbolRva(&symbolStreamBuffer, peFileBuffer.Buffer, targetSymbol, &finalRva);
+
+	uintptr_t in_memory_address = dwmcoreBase + finalRva;
+
+
+
+	// open process handle
+	PVOID base = PAGE_ALIGN(in_memory_address);
+	SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES(in_memory_address, 3) * PAGE_SIZE;
+	ULONG oldProt = 0, tmp = 0;
+
+
+	HANDLE hProc = NULL;
+	status = ObOpenObjectByPointer(
+		sourceProcess,
+		OBJ_KERNEL_HANDLE,
+		NULL,
+		PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+		*PsProcessType,
+		KernelMode,
+		&hProc
+	);
+
+
+	NTSTATUS st = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
+	SIZE_T wrote = 0;
+	NTSTATUS st2 = MmCopyVirtualMemory(
+		PsGetCurrentProcess(), (PVOID)"\x30\xC0\xC3", // // xor al, al; ret
+		sourceProcess, in_memory_address, 3, KernelMode, &wrote);
+
+	ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+
+	ZwFlushInstructionCache(hProc, in_memory_address, 3);
+
+
+	return 0;
+
 }

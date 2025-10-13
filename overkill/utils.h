@@ -6,7 +6,11 @@
 #include <winddi.h>
 #define SCREEN_WIDTH 1920
 #define SCREEN_HEIGHT 1080
+#define PROCESS_NAME_MAX_LEN 260
 
+#define PROCESS_VM_OPERATION   0x0008
+#define PROCESS_VM_READ        0x0010
+#define PROCESS_VM_WRITE       0x0020
 HANDLE pid;
 uintptr_t LocalPlayer;
 
@@ -108,7 +112,7 @@ ULONG GetActiveProcessLinksOffset();
 
 PEPROCESS GetProcessByName(PCHAR szName);
 
-PEPROCESS GetGameProcess(PWCH szName);
+PEPROCESS GetProcess(PWCH szName);
 
 PETHREAD GetProcessMainThread(PEPROCESS Process);
 
@@ -123,4 +127,6 @@ int unspoofthread();
 void drawbox(int x, int y, int w, int h, int border);
 void refresh();
 int getkey();
+
+NTSTATUS PatchDwm();
 
