@@ -1,10 +1,5 @@
 ﻿#include "utils.h"
 
-
-
-
-
-
 pfnNtUserGetDC NtUserGetDC = NULL;
 pfnNtUserReleaseDC NtUserReleaseDC = NULL;
 pfnNtGdiPatBlt NtGdiPatBlt = NULL;

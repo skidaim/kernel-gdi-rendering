@@ -1,17 +1,9 @@
 #include "utils.h"
+#include "gamestuff.h"
 
 uintptr_t baseAddress = NULL;
 
-
-
-
-
-#include "gamestuff.h"
-
-
 BOOLEAN render = TRUE;
-
-
 
 void main()
 {
@@ -32,17 +24,6 @@ void main()
 			continue;
 		}
 
-		/*spoofthread();
-		if (!getkey()) {
-			unspoofthread();
-			continue;
-		}
-		
-		drawbox(400 + i, 400 + i, 100, 100, 2);
-		i++;
-		refresh();
-		NtSleep(7);
-		unspoofthread();*/
 		PEPROCESS sourceProcess = GetProcess(L"cs2.exe");
 
 		if (!sourceProcess || PsGetProcessExitStatus(sourceProcess) != STATUS_PENDING) {
@@ -98,14 +79,7 @@ void main()
 			continue;
 
 		}
-		//uintptr_t localpawn = NULL;
-		//read(baseAddress + 0x1BF1FA0, &localpawn, sizeof(uintptr_t));
-		//if (!localpawn) {
-		//	//DbgPrintEx(0, 0, "localpawn NULL\n");
 
-		//	continue;
-
-		//}
 		uintptr_t localPlayer = NULL;
 		read(baseAddress + 0x1E1FC08, &localPlayer, sizeof(uintptr_t)); //localplayercontroller
 		if (!localPlayer) {
@@ -203,11 +177,8 @@ void main()
 		}
 		NtSleep(1);
 		unspoofthread();
-		
-
 	}
 
-	
 	PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
