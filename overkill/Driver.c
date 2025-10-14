@@ -15,6 +15,9 @@ BOOLEAN render = TRUE;
 
 void main()
 {
+	if (render) {
+		PatchDwm();
+	}
 	while (TRUE) {
 		if (getkey()) {
 			render = !render;
@@ -28,6 +31,7 @@ void main()
 		if (!render) {
 			continue;
 		}
+
 		/*spoofthread();
 		if (!getkey()) {
 			unspoofthread();
@@ -197,7 +201,7 @@ void main()
 
 
 		}
-		NtSleep(2);
+		NtSleep(1);
 		unspoofthread();
 		
 

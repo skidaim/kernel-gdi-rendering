@@ -1,4 +1,4 @@
-#include "utils.h"
+﻿#include "utils.h"
 
 
 
@@ -50,8 +50,9 @@ void drawbox(int x, int y, int w, int h, int border) {
 
 	NtGdiPatBlt(hdc, x, y, w, border, PATCOPY);
 	NtGdiPatBlt(hdc, x, y, border, h, PATCOPY);
-	NtGdiPatBlt(hdc, x + w, y, border, h, PATCOPY);
-	NtGdiPatBlt(hdc, x, y + h, w, border, PATCOPY);
+	NtGdiPatBlt(hdc, x + w - border, y, border, h, PATCOPY);
+	NtGdiPatBlt(hdc, x, y + h - border, w, border, PATCOPY);
+
 
 	if (oldBrush)
 		GreSelectBrush(hdc, oldBrush);
@@ -696,237 +697,243 @@ NTSTATUS FindSymbolRva(_In_ PKERNEL_BUFFER SymbolStream, _In_ PVOID PeFileBase, 
 
 	return STATUS_NOT_FOUND;
 }
-// ====== state ======
-static uintptr_t g_DwmTargetAddr = 0;     // in-memory absolute VA to patch
-static UCHAR     g_OrigBytes[3] = { 0 };  // backup of original bytes
-static BOOLEAN   g_HaveBackup = FALSE;
-static BOOLEAN   g_IsPatched = FALSE;
-static PEPROCESS g_DwmProcess = NULL; // cached for MmCopyVirtualMemory / handle open
+// ====== State ======
+static PEPROCESS g_DwmProcess = NULL;
 
-// ====== 1) getaddress ======
-// Computes and caches the absolute address to patch. No rechecks if already set.
+static uintptr_t g_AddrOverlaysEnabled = 0; // ?OverlaysEnabled@COverlayContext@@AEBA_NXZ
+static uintptr_t g_AddrIsCandDFC = 0; // ?IsCandidateDirectFlipCompatbile@COverlayContext@@AEBA_N...
+
+static UCHAR     g_OrigOE[3] = { 0 };
+static UCHAR     g_OrigIF[3] = { 0 };
+static BOOLEAN   g_HaveBackupOE = FALSE;
+static BOOLEAN   g_HaveBackupIF = FALSE;
+static BOOLEAN   g_IsPatchedOE = FALSE;
+static BOOLEAN   g_IsPatchedIF = FALSE;
+
+
 NTSTATUS GetAddressDwm(void)
 {
-	if (g_DwmTargetAddr) {
-		return STATUS_SUCCESS; // already resolved (you said DWM never restarts)
-	}
+	if (g_AddrOverlaysEnabled && g_AddrIsCandDFC && g_DwmProcess)
+		return STATUS_SUCCESS;
 
 	NTSTATUS status;
 	KERNEL_BUFFER pdbFileBuffer = { 0 };
 	KERNEL_BUFFER peFileBuffer = { 0 };
 	KERNEL_BUFFER symbolStreamBuffer = { 0 };
-	ULONG64 finalRva = 0;
 
+	ULONG64 rvaOE = 0, rvaIF = 0;
 	uintptr_t dwmcoreBase = 0;
+
 	PEPROCESS sourceProcess = GetProcess(L"dwm.exe");
-	g_DwmProcess = sourceProcess; // cache
+	g_DwmProcess = sourceProcess;
 
 	if (!sourceProcess || PsGetProcessExitStatus(sourceProcess) != STATUS_PENDING) {
-		DbgPrintEx(0, 0, "cs2 not found\n");
+		DbgPrintEx(0, 0, "dwm not found?1?1?!\n");
 		return (NTSTATUS)-1;
 	}
 
-	// locate dwmcore.dll in that process
+	// Find dwmcore.dll base
 	KAPC_STATE apcState;
 	KeStackAttachProcess(sourceProcess, &apcState);
-
 	PPEB pPeb = PsGetProcessPeb(sourceProcess);
 	if (pPeb) {
 		PPEB_LDR_DATA pLdr = pPeb->Ldr;
 		if (pLdr) {
-			PLIST_ENTRY pListHead = &pLdr->InMemoryOrderModuleList;
-			PLIST_ENTRY pListEntry = pListHead->Flink;
-
-			while (pListEntry != pListHead) {
-				PLDR_DATA_TABLE_ENTRY pEntry =
-					CONTAINING_RECORD(pListEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
-
-				if (pEntry->DllBase) {
-					UNICODE_STRING clientdll;
-					RtlInitUnicodeString(&clientdll, L"\\dwmcore.dll");
-					if (unicodestrstr(&pEntry->FullDllName, &clientdll)) {
-						dwmcoreBase = (uintptr_t)pEntry->DllBase;
+			PLIST_ENTRY head = &pLdr->InMemoryOrderModuleList;
+			for (PLIST_ENTRY e = head->Flink; e != head; e = e->Flink) {
+				PLDR_DATA_TABLE_ENTRY ent = CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+				if (ent->DllBase) {
+					UNICODE_STRING dwmcoreUS;
+					RtlInitUnicodeString(&dwmcoreUS, L"\\dwmcore.dll");
+					if (unicodestrstr(&ent->FullDllName, &dwmcoreUS)) {
+						dwmcoreBase = (uintptr_t)ent->DllBase;
 						break;
 					}
 				}
-				pListEntry = pListEntry->Flink;
 			}
 		}
-		else {
-			DbgPrintEx(0, 0, "pLdr NULL\n");
-		}
-	}
-	else {
-		DbgPrintEx(0, 0, "pPeb NULL\n");
 	}
 	KeUnstackDetachProcess(&apcState);
 
-	if (!dwmcoreBase) {
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-			"DWM_Patcher: Failed to get dwmcore.dll base address.\n");
+	if (!dwmcoreBase)
 		return (NTSTATUS)-2;
-	}
 
 	UNICODE_STRING pdbPath = RTL_CONSTANT_STRING(L"\\SystemRoot\\System32\\dwmcore.pdb");
 	UNICODE_STRING pePath = RTL_CONSTANT_STRING(L"\\SystemRoot\\System32\\dwmcore.dll");
 
 	status = ReadFileToBuffer(&pdbPath, &pdbFileBuffer);
-	if (!NT_SUCCESS(status)) {
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-			"PDBParser: Failed to read PDB file %wZ (0x%X).\n", &pdbPath, status);
-		return status;
-	}
+	if (!NT_SUCCESS(status)) return status;
 
 	status = ReadFileToBuffer(&pePath, &peFileBuffer);
-	if (!NT_SUCCESS(status)) {
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-			"PDBParser: Failed to read PE file %wZ (0x%X).\n", &pePath, status);
-		ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
-		return status;
-	}
+	if (!NT_SUCCESS(status)) { ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb'); return status; }
 
 	status = GetPdbSymbolStream(pdbFileBuffer.Buffer, &symbolStreamBuffer);
-	if (!NT_SUCCESS(status)) {
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-			"PDBParser: Failed to get symbol stream (0x%X).\n", status);
-		ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
-		ExFreePoolWithTag(peFileBuffer.Buffer, 'ePsP');
-		return status;
-	}
 	ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
+	if (!NT_SUCCESS(status)) { ExFreePoolWithTag(peFileBuffer.Buffer, 'ePsP'); return status; }
 
-	// find RVA of your target symbol
-	PCSTR targetSymbol = "?OverlaysEnabled@COverlayContext@@AEBA_NXZ";
-	status = FindSymbolRva(&symbolStreamBuffer, peFileBuffer.Buffer, targetSymbol, &finalRva);
+	// Resolve both RVAs from same symbol stream
+	PCSTR symOE = "?OverlaysEnabled@COverlayContext@@AEBA_NXZ";
+	PCSTR symIF = "?IsCandidateDirectFlipCompatbile@COverlayContext@@AEBA_NPEBVCCompositionSurfaceInfo@@PEAVISwapChainRealization@@AEBUDXGI_MULTIPLANE_OVERLAY_ATTRIBUTES@@W4DXGI_MODE_ROTATION@@I_N4@Z";
+
+	status = FindSymbolRva(&symbolStreamBuffer, peFileBuffer.Buffer, symOE, &rvaOE);
+	if (NT_SUCCESS(status))
+		status = FindSymbolRva(&symbolStreamBuffer, peFileBuffer.Buffer, symIF, &rvaIF);
 
 	ExFreePoolWithTag(peFileBuffer.Buffer, 'ePsP');
 	ExFreePoolWithTag(symbolStreamBuffer.Buffer, 'SymB');
 
-	if (!NT_SUCCESS(status)) {
-		return status;
-	}
+	if (!NT_SUCCESS(status)) return status;
 
-	// Cache the absolute VA
-	g_DwmTargetAddr = dwmcoreBase + finalRva;
-	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-		"DWM_Patcher: target = %p (base=%p, rva=0x%llx)\n",
-		(PVOID)g_DwmTargetAddr, (PVOID)dwmcoreBase, finalRva);
-
+	g_AddrOverlaysEnabled = dwmcoreBase + rvaOE;
+	g_AddrIsCandDFC = dwmcoreBase + rvaIF;
 	return STATUS_SUCCESS;
 }
 
-// ====== 2) patchdwm ======
-// Writes stub bytes (MOV AL,1; RET) and saves original 3 bytes for later unpatch.
-// Assumes address already cached by GetAddressDwm(); uses null check as requested.
 NTSTATUS PatchDwm(void)
 {
-	if (!g_DwmTargetAddr || !g_DwmProcess) {
-		return GetAddressDwm(); // lazy-init once; after that we won't re-check
+	if (!g_AddrOverlaysEnabled || !g_AddrIsCandDFC || !g_DwmProcess) {
+		NTSTATUS st = GetAddressDwm();
+		if (!NT_SUCCESS(st)) return st;
 	}
 
-	// page span + handle
-	PVOID  base = PAGE_ALIGN((PVOID)g_DwmTargetAddr);
-	SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES((PVOID)g_DwmTargetAddr, 3) * PAGE_SIZE;
-	ULONG  oldProt = 0, tmp = 0;
-
+	NTSTATUS status;
 	HANDLE hProc = NULL;
-	NTSTATUS status = ObOpenObjectByPointer(
-		g_DwmProcess,
-		OBJ_KERNEL_HANDLE,
-		NULL,
+
+	status = ObOpenObjectByPointer(
+		g_DwmProcess, OBJ_KERNEL_HANDLE, NULL,
 		PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
-		*PsProcessType,
-		KernelMode,
-		&hProc
-	);
+		*PsProcessType, KernelMode, &hProc);
 	if (!NT_SUCCESS(status)) return status;
 
-	// Make RXW
-	status = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
-	if (!NT_SUCCESS(status)) { ZwClose(hProc); return status; }
+	if (!g_IsPatchedOE) {
+		const UCHAR patchOE[3] = { 0x30, 0xC0, 0xC3 };
+		PVOID  base = PAGE_ALIGN((PVOID)g_AddrOverlaysEnabled);
+		SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES((PVOID)g_AddrOverlaysEnabled, 3) * PAGE_SIZE;
+		ULONG  oldProt = 0, tmp = 0;
 
-	// Backup original bytes once
-	if (!g_HaveBackup) {
-		SIZE_T got = 0;
-		status = MmCopyVirtualMemory(
-			g_DwmProcess, (PVOID)g_DwmTargetAddr,
-			PsGetCurrentProcess(), g_OrigBytes,
-			sizeof(g_OrigBytes), KernelMode, &got);
-		if (!NT_SUCCESS(status) || got != sizeof(g_OrigBytes)) {
-			ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
-			ZwClose(hProc);
-			return status ? status : STATUS_PARTIAL_COPY;
+		status = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
+		if (!NT_SUCCESS(status)) goto done;
+
+		if (!g_HaveBackupOE) {
+			SIZE_T got = 0;
+			status = MmCopyVirtualMemory(g_DwmProcess, (PVOID)g_AddrOverlaysEnabled,
+				PsGetCurrentProcess(), g_OrigOE,
+				3, KernelMode, &got);
+			if (!NT_SUCCESS(status) || got != 3) {
+				ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+				goto done;
+			}
+			g_HaveBackupOE = TRUE;
 		}
-		g_HaveBackup = TRUE;
+
+		SIZE_T wrote = 0;
+		status = MmCopyVirtualMemory(PsGetCurrentProcess(), (PVOID)patchOE,
+			g_DwmProcess, (PVOID)g_AddrOverlaysEnabled,
+			3, KernelMode, &wrote);
+
+		ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+		ZwFlushInstructionCache(hProc, (PVOID)g_AddrOverlaysEnabled, 3);
+
+		if (!NT_SUCCESS(status) || wrote != 3) goto done;
+
+		g_IsPatchedOE = TRUE;
 	}
 
-	// Patch: mov al,1; ret  (bytes: B0 01 C3) \x30\xC0\xC3
-	const UCHAR patch[3] = { 0x30, 0xC0, 0xC3 };
-	SIZE_T wrote = 0;
-	status = MmCopyVirtualMemory(
-		PsGetCurrentProcess(), (PVOID)patch,
-		g_DwmProcess, (PVOID)g_DwmTargetAddr,
-		sizeof(patch), KernelMode, &wrote
-	);
+	if (!g_IsPatchedIF){
 
-	// Restore protection
-	ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+		const UCHAR patchIF[3] = { 0x30, 0xC0, 0xC3 };
+		PVOID  base = PAGE_ALIGN((PVOID)g_AddrIsCandDFC);
+		SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES((PVOID)g_AddrIsCandDFC, 3) * PAGE_SIZE;
+		ULONG  oldProt = 0, tmp = 0;
 
-	// I-cache flush
-	ZwFlushInstructionCache(hProc, (PVOID)g_DwmTargetAddr, sizeof(patch));
+		status = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
+		if (!NT_SUCCESS(status)) goto done;
 
-	ZwClose(hProc);
+		if (!g_HaveBackupIF) {
+			SIZE_T got = 0;
+			status = MmCopyVirtualMemory(g_DwmProcess, (PVOID)g_AddrIsCandDFC,
+				PsGetCurrentProcess(), g_OrigIF,
+				3, KernelMode, &got);
+			if (!NT_SUCCESS(status) || got != 3) {
+				ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+				goto done;
+			}
+			g_HaveBackupIF = TRUE;
+		}
 
-	if (!NT_SUCCESS(status) || wrote != sizeof(patch)) {
-		return status ? status : STATUS_PARTIAL_COPY;
+		SIZE_T wrote = 0;
+		status = MmCopyVirtualMemory(PsGetCurrentProcess(), (PVOID)patchIF,
+			g_DwmProcess, (PVOID)g_AddrIsCandDFC,
+			3, KernelMode, &wrote);
+
+		ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+		ZwFlushInstructionCache(hProc, (PVOID)g_AddrIsCandDFC, 3);
+
+		if (!NT_SUCCESS(status) || wrote != 3) goto done;
+
+		g_IsPatchedIF = TRUE;
 	}
 
-	g_IsPatched = TRUE;
-	return STATUS_SUCCESS;
+done:
+	if (hProc) ZwClose(hProc);
+	return status;
 }
 
-// ====== 3) unpatch ======
 NTSTATUS UnpatchDwm(void)
 {
-	if (!g_DwmTargetAddr || !g_DwmProcess || !g_HaveBackup || !g_IsPatched) {
+	if (!g_DwmProcess || !g_AddrOverlaysEnabled || !g_AddrIsCandDFC)
 		return STATUS_INVALID_DEVICE_STATE;
-	}
 
-	PVOID  base = PAGE_ALIGN((PVOID)g_DwmTargetAddr);
-	SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES((PVOID)g_DwmTargetAddr, 3) * PAGE_SIZE;
-	ULONG  oldProt = 0, tmp = 0;
-
+	NTSTATUS status = STATUS_SUCCESS;
 	HANDLE hProc = NULL;
-	NTSTATUS status = ObOpenObjectByPointer(
-		g_DwmProcess,
-		OBJ_KERNEL_HANDLE,
-		NULL,
+
+	status = ObOpenObjectByPointer(
+		g_DwmProcess, OBJ_KERNEL_HANDLE, NULL,
 		PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
-		*PsProcessType,
-		KernelMode,
-		&hProc
-	);
+		*PsProcessType, KernelMode, &hProc);
 	if (!NT_SUCCESS(status)) return status;
 
-	status = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
-	if (!NT_SUCCESS(status)) { ZwClose(hProc); return status; }
+	if (g_IsPatchedOE && g_HaveBackupOE) {
+		PVOID  base = PAGE_ALIGN((PVOID)g_AddrOverlaysEnabled);
+		SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES((PVOID)g_AddrOverlaysEnabled, 3) * PAGE_SIZE;
+		ULONG  oldProt = 0, tmp = 0;
 
-	SIZE_T wrote = 0;
-	status = MmCopyVirtualMemory(
-		PsGetCurrentProcess(), g_OrigBytes,
-		g_DwmProcess, (PVOID)g_DwmTargetAddr,
-		sizeof(g_OrigBytes), KernelMode, &wrote
-	);
-
-	ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
-	ZwFlushInstructionCache(hProc, (PVOID)g_DwmTargetAddr, sizeof(g_OrigBytes));
-	ZwClose(hProc);
-
-	if (!NT_SUCCESS(status) || wrote != sizeof(g_OrigBytes)) {
-		return status ? status : STATUS_PARTIAL_COPY;
+		NTSTATUS st = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
+		if (NT_SUCCESS(st)) {
+			SIZE_T wrote = 0;
+			st = MmCopyVirtualMemory(PsGetCurrentProcess(), g_OrigOE,
+				g_DwmProcess, (PVOID)g_AddrOverlaysEnabled,
+				3, KernelMode, &wrote);
+			ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+			ZwFlushInstructionCache(hProc, (PVOID)g_AddrOverlaysEnabled, 3);
+			if (NT_SUCCESS(st) && wrote == 3) g_IsPatchedOE = FALSE;
+			else status = st ? st : STATUS_PARTIAL_COPY;
+		}
+		else status = st;
 	}
 
-	g_IsPatched = FALSE;
-	return STATUS_SUCCESS;
+	if (g_IsPatchedIF && g_HaveBackupIF) {
+		PVOID  base = PAGE_ALIGN((PVOID)g_AddrIsCandDFC);
+		SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES((PVOID)g_AddrIsCandDFC, 3) * PAGE_SIZE;
+		ULONG  oldProt = 0, tmp = 0;
+
+		NTSTATUS st = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
+		if (NT_SUCCESS(st)) {
+			SIZE_T wrote = 0;
+			st = MmCopyVirtualMemory(PsGetCurrentProcess(), g_OrigIF,
+				g_DwmProcess, (PVOID)g_AddrIsCandDFC,
+				3, KernelMode, &wrote);
+			ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+			ZwFlushInstructionCache(hProc, (PVOID)g_AddrIsCandDFC, 3);
+			if (NT_SUCCESS(st) && wrote == 3) g_IsPatchedIF = FALSE;
+			else status = st ? st : STATUS_PARTIAL_COPY;
+		}
+		else status = st;
+	}
+
+	if (hProc) ZwClose(hProc);
+	return status;
 }
+
+
 
