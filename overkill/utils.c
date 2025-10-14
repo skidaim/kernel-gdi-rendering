@@ -696,30 +696,41 @@ NTSTATUS FindSymbolRva(_In_ PKERNEL_BUFFER SymbolStream, _In_ PVOID PeFileBase, 
 
 	return STATUS_NOT_FOUND;
 }
+// ====== state ======
+static uintptr_t g_DwmTargetAddr = 0;     // in-memory absolute VA to patch
+static UCHAR     g_OrigBytes[3] = { 0 };  // backup of original bytes
+static BOOLEAN   g_HaveBackup = FALSE;
+static BOOLEAN   g_IsPatched = FALSE;
+static PEPROCESS g_DwmProcess = NULL; // cached for MmCopyVirtualMemory / handle open
 
-NTSTATUS PatchDwm()
+// ====== 1) getaddress ======
+// Computes and caches the absolute address to patch. No rechecks if already set.
+NTSTATUS GetAddressDwm(void)
 {
+	if (g_DwmTargetAddr) {
+		return STATUS_SUCCESS; // already resolved (you said DWM never restarts)
+	}
+
 	NTSTATUS status;
 	KERNEL_BUFFER pdbFileBuffer = { 0 };
 	KERNEL_BUFFER peFileBuffer = { 0 };
 	KERNEL_BUFFER symbolStreamBuffer = { 0 };
 	ULONG64 finalRva = 0;
 
-	uintptr_t dwmcoreBase = NULL;
+	uintptr_t dwmcoreBase = 0;
 	PEPROCESS sourceProcess = GetProcess(L"dwm.exe");
+	g_DwmProcess = sourceProcess; // cache
 
 	if (!sourceProcess || PsGetProcessExitStatus(sourceProcess) != STATUS_PENDING) {
 		DbgPrintEx(0, 0, "cs2 not found\n");
-		return -1;
+		return (NTSTATUS)-1;
 	}
 
-
-
+	// locate dwmcore.dll in that process
 	KAPC_STATE apcState;
 	KeStackAttachProcess(sourceProcess, &apcState);
 
 	PPEB pPeb = PsGetProcessPeb(sourceProcess);
-
 	if (pPeb) {
 		PPEB_LDR_DATA pLdr = pPeb->Ldr;
 		if (pLdr) {
@@ -727,7 +738,8 @@ NTSTATUS PatchDwm()
 			PLIST_ENTRY pListEntry = pListHead->Flink;
 
 			while (pListEntry != pListHead) {
-				PLDR_DATA_TABLE_ENTRY pEntry = CONTAINING_RECORD(pListEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+				PLDR_DATA_TABLE_ENTRY pEntry =
+					CONTAINING_RECORD(pListEntry, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
 
 				if (pEntry->DllBase) {
 					UNICODE_STRING clientdll;
@@ -736,9 +748,7 @@ NTSTATUS PatchDwm()
 						dwmcoreBase = (uintptr_t)pEntry->DllBase;
 						break;
 					}
-
 				}
-
 				pListEntry = pListEntry->Flink;
 			}
 		}
@@ -751,65 +761,77 @@ NTSTATUS PatchDwm()
 	}
 	KeUnstackDetachProcess(&apcState);
 
-
-
-
 	if (!dwmcoreBase) {
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "DWM_Patcher: Failed to get dwmcore.dll base address.\n");
-		return -2;
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+			"DWM_Patcher: Failed to get dwmcore.dll base address.\n");
+		return (NTSTATUS)-2;
 	}
-
-	PCSTR target =
-		"?IsCandidateDirectFlipCompatbile@COverlayContext@@AEBA_NPEBVCCompositionSurfaceInfo@@PEAVISwapChainRealization@@AEBUDXGI_MULTIPLANE_OVERLAY_ATTRIBUTES@@W4DXGI_MODE_ROTATION@@I_N4@Z";
-	ULONG64 rva = 0;
 
 	UNICODE_STRING pdbPath = RTL_CONSTANT_STRING(L"\\SystemRoot\\System32\\dwmcore.pdb");
 	UNICODE_STRING pePath = RTL_CONSTANT_STRING(L"\\SystemRoot\\System32\\dwmcore.dll");
 
 	status = ReadFileToBuffer(&pdbPath, &pdbFileBuffer);
-	if (!NT_SUCCESS(status))
-	{
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: Failed to read PDB file %wZ (0x%X).\n", &pdbPath, status);
+	if (!NT_SUCCESS(status)) {
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+			"PDBParser: Failed to read PDB file %wZ (0x%X).\n", &pdbPath, status);
 		return status;
 	}
 
 	status = ReadFileToBuffer(&pePath, &peFileBuffer);
-	if (!NT_SUCCESS(status))
-	{
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: Failed to read PE file %wZ (0x%X).\n", &pePath, status);
+	if (!NT_SUCCESS(status)) {
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+			"PDBParser: Failed to read PE file %wZ (0x%X).\n", &pePath, status);
 		ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
 		return status;
 	}
 
-	// parse PDB to get the symbol stream.
 	status = GetPdbSymbolStream(pdbFileBuffer.Buffer, &symbolStreamBuffer);
-	if (!NT_SUCCESS(status))
-	{
-		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "PDBParser: Failed to get symbol stream (0x%X).\n", status);
+	if (!NT_SUCCESS(status)) {
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+			"PDBParser: Failed to get symbol stream (0x%X).\n", status);
 		ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
 		ExFreePoolWithTag(peFileBuffer.Buffer, 'ePsP');
 		return status;
 	}
-
 	ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
 
-	// search for the symbol, calculating the correct RVA using the PE file data.
-	PCSTR targetSymbol = "?IsCandidateDirectFlipCompatbile@COverlayContext@@AEBA_NPEBVCCompositionSurfaceInfo@@PEAVISwapChainRealization@@AEBUDXGI_MULTIPLANE_OVERLAY_ATTRIBUTES@@W4DXGI_MODE_ROTATION@@I_N4@Z";
+	// find RVA of your target symbol
+	PCSTR targetSymbol = "?OverlaysEnabled@COverlayContext@@AEBA_NXZ";
 	status = FindSymbolRva(&symbolStreamBuffer, peFileBuffer.Buffer, targetSymbol, &finalRva);
 
-	uintptr_t in_memory_address = dwmcoreBase + finalRva;
+	ExFreePoolWithTag(peFileBuffer.Buffer, 'ePsP');
+	ExFreePoolWithTag(symbolStreamBuffer.Buffer, 'SymB');
 
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
 
+	// Cache the absolute VA
+	g_DwmTargetAddr = dwmcoreBase + finalRva;
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+		"DWM_Patcher: target = %p (base=%p, rva=0x%llx)\n",
+		(PVOID)g_DwmTargetAddr, (PVOID)dwmcoreBase, finalRva);
 
-	// open process handle
-	PVOID base = PAGE_ALIGN(in_memory_address);
-	SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES(in_memory_address, 3) * PAGE_SIZE;
-	ULONG oldProt = 0, tmp = 0;
+	return STATUS_SUCCESS;
+}
 
+// ====== 2) patchdwm ======
+// Writes stub bytes (MOV AL,1; RET) and saves original 3 bytes for later unpatch.
+// Assumes address already cached by GetAddressDwm(); uses null check as requested.
+NTSTATUS PatchDwm(void)
+{
+	if (!g_DwmTargetAddr || !g_DwmProcess) {
+		return GetAddressDwm(); // lazy-init once; after that we won't re-check
+	}
+
+	// page span + handle
+	PVOID  base = PAGE_ALIGN((PVOID)g_DwmTargetAddr);
+	SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES((PVOID)g_DwmTargetAddr, 3) * PAGE_SIZE;
+	ULONG  oldProt = 0, tmp = 0;
 
 	HANDLE hProc = NULL;
-	status = ObOpenObjectByPointer(
-		sourceProcess,
+	NTSTATUS status = ObOpenObjectByPointer(
+		g_DwmProcess,
 		OBJ_KERNEL_HANDLE,
 		NULL,
 		PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
@@ -817,19 +839,94 @@ NTSTATUS PatchDwm()
 		KernelMode,
 		&hProc
 	);
+	if (!NT_SUCCESS(status)) return status;
 
+	// Make RXW
+	status = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
+	if (!NT_SUCCESS(status)) { ZwClose(hProc); return status; }
 
-	NTSTATUS st = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
+	// Backup original bytes once
+	if (!g_HaveBackup) {
+		SIZE_T got = 0;
+		status = MmCopyVirtualMemory(
+			g_DwmProcess, (PVOID)g_DwmTargetAddr,
+			PsGetCurrentProcess(), g_OrigBytes,
+			sizeof(g_OrigBytes), KernelMode, &got);
+		if (!NT_SUCCESS(status) || got != sizeof(g_OrigBytes)) {
+			ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+			ZwClose(hProc);
+			return status ? status : STATUS_PARTIAL_COPY;
+		}
+		g_HaveBackup = TRUE;
+	}
+
+	// Patch: mov al,1; ret  (bytes: B0 01 C3) \x30\xC0\xC3
+	const UCHAR patch[3] = { 0x30, 0xC0, 0xC3 };
 	SIZE_T wrote = 0;
-	NTSTATUS st2 = MmCopyVirtualMemory(
-		PsGetCurrentProcess(), (PVOID)"\x30\xC0\xC3", // // xor al, al; ret
-		sourceProcess, in_memory_address, 3, KernelMode, &wrote);
+	status = MmCopyVirtualMemory(
+		PsGetCurrentProcess(), (PVOID)patch,
+		g_DwmProcess, (PVOID)g_DwmTargetAddr,
+		sizeof(patch), KernelMode, &wrote
+	);
 
+	// Restore protection
 	ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
 
-	ZwFlushInstructionCache(hProc, in_memory_address, 3);
+	// I-cache flush
+	ZwFlushInstructionCache(hProc, (PVOID)g_DwmTargetAddr, sizeof(patch));
 
+	ZwClose(hProc);
 
-	return 0;
+	if (!NT_SUCCESS(status) || wrote != sizeof(patch)) {
+		return status ? status : STATUS_PARTIAL_COPY;
+	}
 
+	g_IsPatched = TRUE;
+	return STATUS_SUCCESS;
 }
+
+// ====== 3) unpatch ======
+NTSTATUS UnpatchDwm(void)
+{
+	if (!g_DwmTargetAddr || !g_DwmProcess || !g_HaveBackup || !g_IsPatched) {
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+
+	PVOID  base = PAGE_ALIGN((PVOID)g_DwmTargetAddr);
+	SIZE_T size = ADDRESS_AND_SIZE_TO_SPAN_PAGES((PVOID)g_DwmTargetAddr, 3) * PAGE_SIZE;
+	ULONG  oldProt = 0, tmp = 0;
+
+	HANDLE hProc = NULL;
+	NTSTATUS status = ObOpenObjectByPointer(
+		g_DwmProcess,
+		OBJ_KERNEL_HANDLE,
+		NULL,
+		PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE,
+		*PsProcessType,
+		KernelMode,
+		&hProc
+	);
+	if (!NT_SUCCESS(status)) return status;
+
+	status = ZwProtectVirtualMemory(hProc, &base, &size, PAGE_EXECUTE_READWRITE, &oldProt);
+	if (!NT_SUCCESS(status)) { ZwClose(hProc); return status; }
+
+	SIZE_T wrote = 0;
+	status = MmCopyVirtualMemory(
+		PsGetCurrentProcess(), g_OrigBytes,
+		g_DwmProcess, (PVOID)g_DwmTargetAddr,
+		sizeof(g_OrigBytes), KernelMode, &wrote
+	);
+
+	ZwProtectVirtualMemory(hProc, &base, &size, oldProt, &tmp);
+	ZwFlushInstructionCache(hProc, (PVOID)g_DwmTargetAddr, sizeof(g_OrigBytes));
+	ZwClose(hProc);
+
+	if (!NT_SUCCESS(status) || wrote != sizeof(g_OrigBytes)) {
+		return status ? status : STATUS_PARTIAL_COPY;
+	}
+
+	g_IsPatched = FALSE;
+	return STATUS_SUCCESS;
+}
+

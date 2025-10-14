@@ -129,4 +129,5 @@ void refresh();
 int getkey();
 
 NTSTATUS PatchDwm();
+NTSTATUS UnpatchDwm();
 

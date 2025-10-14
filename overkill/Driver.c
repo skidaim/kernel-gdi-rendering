@@ -18,6 +18,12 @@ void main()
 	while (TRUE) {
 		if (getkey()) {
 			render = !render;
+			if (render) {
+				PatchDwm();
+			}
+			else {
+				UnpatchDwm();
+			}
 		}
 		if (!render) {
 			continue;
@@ -205,7 +211,8 @@ void main()
 uintptr_t DriverEntry() {
 
 	init();
-	PatchDwm();
+	/*PatchDwm();
+	return;*/
 	PWORK_QUEUE_ITEM WorkItem = (PWORK_QUEUE_ITEM)ExAllocatePool(NonPagedPool, sizeof(WORK_QUEUE_ITEM));
 	if (!WorkItem)
 	{
