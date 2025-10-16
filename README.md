@@ -1,6 +1,6 @@
-# Kernel GDI Rendering example
+# Kernel GDI Rendering
 
-## Fully-kernel CS2 cheat that:
+## Fully-kernel CS2 cheat (esp-only basic example) that:
 
 * **Patches DWM (user-mode) from kernel** to suppress independent flip:
   * `COverlayContext::OverlaysEnabled()` → returns false
