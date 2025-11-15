@@ -49,4 +49,3 @@ Temporarily spoofs the current thread as DWM’s Win32 thread to make win32k cal
   ```
      
   But obviously not since patching OverlaysEnabled also blocks the Hardware: Independent Flip path. 
-    
