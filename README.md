@@ -3,10 +3,10 @@
 ## Fully-kernel CS2 cheat (esp-only basic example) that:
 
 * **Patches DWM (user-mode) from kernel** to suppress independent flip:
-  * `COverlayContext::OverlaysEnabled()` → returns false
-  * `COverlayContext::IsCandidateDirectFlipCompatbile(...)` → returns false
-  * (Both are resolved via **dwmcore.pdb** and hot-patched in `dwmcore.dll` inside dwm.exe.)   
-  * Result: Game's swapchain (or any for that matter) stays **Composed: Flip**, dwm composes and your GDI boxes show on top of the game (even in windowed fullscreen/fullscreen).
+  * `COverlayContext::OverlaysEnabled()` -> returns false
+  * `COverlayContext::IsCandidateDirectFlipCompatbile(...)` -> returns false
+  * (Both are resolved via **dwmcore.pdb** (kernel pdb parser) and patched in `dwmcore.dll` inside dwm.exe.)   
+  * Game's swapchain (or any for that matter) stays **Composed: Flip**, dwm composes and your GDI boxes show on top of the game (even in windowed fullscreen/fullscreen).
   * Make sure to NOT disable fullscreen optimizations if you want fullscreen, that will lead to FSE (Hardware: Legacy Flip) and DWM won't takeover.
 * **Draws boxes with kernel GDI** (`NtGdiPatBlt`). 
 * **Toggles drawing at runtime** with a key (XButton1) to switch between DirectFlip and Independent Flip.   
