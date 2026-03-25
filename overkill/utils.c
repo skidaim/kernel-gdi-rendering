@@ -91,6 +91,8 @@ NTSTATUS read(PVOID address, void* buffer, SIZE_T size) {
 		&bytesRead
 	);
 
+	ObDereferenceObject(Process);
+
 	if (!NT_SUCCESS(status) || bytesRead != size) {
 		return STATUS_UNSUCCESSFUL;
 	}
@@ -764,7 +766,8 @@ NTSTATUS GetAddressDwm(void)
 
 	status = GetPdbSymbolStream(pdbFileBuffer.Buffer, &symbolStreamBuffer);
 	ExFreePoolWithTag(pdbFileBuffer.Buffer, 'bPdb');
-	if (!NT_SUCCESS(status)) { ExFreePoolWithTag(peFileBuffer.Buffer, 'ePsP'); return status; }
+	if (!NT_SUCCESS(status)) { DbgPrintEx(0, 0, "dwm not found?1?1?!\n"); ExFreePoolWithTag(peFileBuffer.Buffer, 'ePsP'); return status; }
+
 
 	// Resolve both RVAs from same symbol stream
 	PCSTR symOE = "?OverlaysEnabled@COverlayContext@@AEBA_NXZ";
@@ -788,7 +791,10 @@ NTSTATUS PatchDwm(void)
 {
 	if (!g_AddrOverlaysEnabled || !g_AddrIsCandDFC || !g_DwmProcess) {
 		NTSTATUS st = GetAddressDwm();
-		if (!NT_SUCCESS(st)) return st;
+		if (!NT_SUCCESS(st)) {
+			DbgPrintEx(0, 0, "no address\n");
+			return st;
+		}
 	}
 
 	NTSTATUS status;
