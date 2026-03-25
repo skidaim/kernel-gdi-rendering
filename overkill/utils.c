@@ -235,22 +235,6 @@ NTSTATUS GetProcessImagePath(PEPROCESS process, PUNICODE_STRING imagePath) {
 	return STATUS_SUCCESS;
 }
 
-// Example usage
-NTSTATUS GetFullImagePathFromProcess(PEPROCESS process) {
-	UNICODE_STRING imagePath;
-	NTSTATUS status = GetProcessImagePath(process, &imagePath);
-
-	if (NT_SUCCESS(status)) {
-		DbgPrintEx(0, 0, "Process full image path: %wZ\n", &imagePath);
-	}
-	else {
-		DbgPrintEx(0, 0, "Failed to get full image path\n");
-	}
-
-	return status;
-}
-
-
 
 int processes = 0;
 
